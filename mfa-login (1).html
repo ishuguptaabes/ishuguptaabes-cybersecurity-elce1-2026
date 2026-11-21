@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secure Login (MFA)</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--tx:#1b1f24;--mut:#6a727c;--bd:#dde1e6;--ac:#2563eb;--ok:#16794a;--bad:#b42318}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111418;--card:#1a1e24;--tx:#e8eaed;--mut:#9aa3ad;--bd:#2c323a;--ac:#6ea0ff;--ok:#4ade80;--bad:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:440px;margin:0 auto;padding:24px 16px}
+h1{font-size:20px;margin:0 0 14px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px}
+input{width:100%;padding:10px;margin-bottom:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);font:inherit}
+button{border:0;border-radius:8px;padding:10px 16px;background:var(--ac);color:#fff;font:inherit;cursor:pointer;width:100%}
+button.s{background:var(--bg);color:var(--tx);border:1px solid var(--bd);width:auto;padding:6px 12px}
+.tabs{display:flex;gap:8px;margin-bottom:12px}.tabs button{flex:1}
+.hide{display:none}
+.msg{min-height:20px;font-size:13px;margin-top:8px}.msg.bad{color:var(--bad)}.msg.ok{color:var(--ok)}
+.key{font:700 15px ui-monospace,Menlo,monospace;letter-spacing:1px;word-break:break-all;background:var(--bg);padding:10px;border-radius:8px;margin:6px 0}
+.big{font:700 28px ui-monospace,Menlo,monospace;letter-spacing:6px}
+.mut{color:var(--mut);font-size:13px}
+details{margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>🛡️ Secure Login · 2-Step Verification</h1>
+<div class="card">
+
+  <!-- Screen 1: register / login -->
+  <div id="auth">
+    <div class="tabs"><button class="s" id="tabL">Login</button><button class="s" id="tabR">Register</button></div>
+    <input id="user" placeholder="Username" autocomplete="off">
+    <input id="pass" type="password" placeholder="Password (min 8 characters)">
+    <button id="submit">Login</button>
+    <div class="msg" id="m1"></div>
+  </div>
+
+  <!-- Screen 2: set up authenticator (register only) -->
+  <div id="setup" class="hide">
+    <b>Set up your authenticator app</b>
+    <p class="mut">Open Google Authenticator / Microsoft Authenticator / Authy → Add account → <i>Enter a setup key</i> and type this key:</p>
+    <div class="key" id="secret"></div>
+    <p class="mut">Then enter the 6-digit code your app shows to finish.</p>
+    <input id="c1" inputmode="numeric" maxlength="6" placeholder="6-digit code" autocomplete="off">
+    <button id="confirm">Confirm &amp; finish</button>
+    <div class="msg" id="m2"></div>
+  </div>
+
+  <!-- Screen 3: second factor at login -->
+  <div id="mfa" class="hide">
+    <b>Step 2: enter your 6-digit code</b>
+    <p class="mut">Open your authenticator app and type the current code.</p>
+    <input id="c2" inputmode="numeric" maxlength="6" placeholder="6-digit code" autocomplete="off">
+    <button id="verify">Verify</button>
+    <div class="msg" id="m3"></div>
+    <details><summary class="mut">Demo helper (no phone?)</summary>
+      <p class="mut">Shows the current code on this same screen. Only for testing: with this, the 2nd factor is no longer a separate device.</p>
+      <div class="big" id="demo">------</div><div class="mut" id="timer"></div></details>
+  </div>
+
+  <!-- Screen 4: logged in -->
+  <div id="home" class="hide">
+    <b style="color:var(--ok)">✔ Logged in with 2-step verification</b>
+    <p>Welcome, <b id="who"></b>. Both your password and your one-time code were verified.</p>
+    <button id="logout">Log out</button>
+  </div>
+</div>
+</main>
+
+<script>
+const $=s=>document.querySelector(s),E=new TextEncoder(),D=new TextDecoder();
+const b64=u=>btoa(String.fromCharCode(...new Uint8Array(u)));
+const ub=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+let store;try{localStorage.setItem('t','1');store=localStorage}catch{store={}}   // memory fallback
+let mode='login',cur=null,fails=0,lockUntil=0,tick;
+
+function show(id){['auth','setup','mfa','home'].forEach(x=>$('#'+x).classList.toggle('hide',x!==id))}
+function say(el,t,ok){const m=$(el);m.textContent=t;m.className='msg '+(ok?'ok':'bad')}
+
+/* ---------- TOTP (RFC 6238): HMAC-SHA1, 30 s steps, 6 digits ---------- */
+const A='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function b32(bytes){let bits='',out='';for(const b of bytes)bits+=b.toString(2).padStart(8,'0');
+  for(let i=0;i<bits.length;i+=5)out+=A[parseInt(bits.slice(i,i+5).padEnd(5,'0'),2)];return out}
+async function totp(secret,t){
+  const c=Math.floor(t/30000),buf=new DataView(new ArrayBuffer(8));buf.setUint32(0,Math.floor(c/2**32));buf.setUint32(4,c>>>0);
+  const k=await crypto.subtle.importKey('raw',secret,{name:'HMAC',hash:'SHA-1'},false,['sign']);
+  const m=new Uint8Array(await crypto.subtle.sign('HMAC',k,buf)),o=m[19]&15;
+  return String(((m[o]&127)<<24|m[o+1]<<16|m[o+2]<<8|m[o+3])%1e6).padStart(6,'0');
+}
+async function checkCode(secret,code){const n=Date.now();
+  for(const d of [-1,0,1])if(await totp(secret,n+d*30000)===code)return true;return false}
+
+/* ---------- password -> AES key; the TOTP secret is stored encrypted ---------- */
+async function derive(pw,salt){
+  const m=await crypto.subtle.importKey('raw',E.encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:200000,hash:'SHA-256'},m,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+
+/* ---------- tabs ---------- */
+function setMode(m){mode=m;$('#submit').textContent=m==='login'?'Login':'Create account';say('#m1','');
+  $('#tabL').style.fontWeight=m==='login'?'700':'400';$('#tabR').style.fontWeight=m==='register'?'700':'400'}
+$('#tabL').onclick=()=>setMode('login');$('#tabR').onclick=()=>setMode('register');setMode('login');
+
+/* ---------- register / login step 1 ---------- */
+$('#submit').onclick=async()=>{
+  const u=$('#user').value.trim().toLowerCase(),p=$('#pass').value;
+  if(!u||p.length<8)return say('#m1','Enter a username and a password of at least 8 characters');
+  if(Date.now()<lockUntil)return say('#m1','Too many attempts. Wait '+Math.ceil((lockUntil-Date.now())/1000)+'s');
+  const rec=store['mfa:'+u];
+  if(mode==='register'){
+    if(rec)return say('#m1','Username already taken');
+    const salt=crypto.getRandomValues(new Uint8Array(16)),secret=crypto.getRandomValues(new Uint8Array(20));
+    cur={u,salt,secret,key:await derive(p,salt)};
+    $('#secret').textContent=b32(secret).match(/.{4}/g).join(' ');
+    show('setup');$('#c1').focus();
+  }else{
+    if(!rec)return fail('#m1');
+    const r=JSON.parse(rec),salt=ub(r.salt),key=await derive(p,salt);
+    try{const secret=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:ub(r.iv)},key,ub(r.data)));
+      cur={u,secret};fails=0;show('mfa');$('#c2').focus();startDemo()}
+    catch{fail('#m1')}
+  }
+};
+function fail(el){fails++;if(fails>=5){lockUntil=Date.now()+30000;fails=0;say(el,'Too many failed attempts. Locked for 30 seconds.')}
+  else say(el,'Wrong username, password or code')}
+
+/* ---------- finish registration: prove the app works, then save ---------- */
+$('#confirm').onclick=async()=>{
+  if(!await checkCode(cur.secret,$('#c1').value.trim()))return say('#m2','Code is wrong. Check the key in your app and try again.');
+  const iv=crypto.getRandomValues(new Uint8Array(12)),ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},cur.key,cur.secret);
+  store['mfa:'+cur.u]=JSON.stringify({salt:b64(cur.salt),iv:b64(iv),data:b64(ct)});
+  cur=null;$('#pass').value='';$('#c1').value='';setMode('login');show('auth');say('#m1','Account created. You can log in now.',true);
+};
+
+/* ---------- login step 2 ---------- */
+$('#verify').onclick=async()=>{
+  if(Date.now()<lockUntil)return say('#m3','Too many attempts. Wait '+Math.ceil((lockUntil-Date.now())/1000)+'s');
+  if(await checkCode(cur.secret,$('#c2').value.trim())){
+    clearInterval(tick);fails=0;$('#who').textContent=cur.u;show('home');
+  }else fail('#m3');
+};
+$('#logout').onclick=()=>{cur=null;$('#pass').value='';$('#c2').value='';show('auth');say('#m1','')};
+
+/* demo helper: live code + countdown */
+function startDemo(){clearInterval(tick);const f=async()=>{
+  $('#demo').textContent=(await totp(cur.secret,Date.now())).replace(/(\d{3})(\d{3})/,'$1 $2');
+  $('#timer').textContent='changes in '+(30-Math.floor(Date.now()/1000)%30)+'s'};f();tick=setInterval(f,1000)}
+</script>
+</body>
+</html>
